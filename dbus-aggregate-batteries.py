@@ -46,6 +46,41 @@ VERSION = "4.3.20260611-beta"
 _STATE_FILE_CHARGE = "/data/apps/dbus-aggregate-batteries/storedvalue_charge"
 _STATE_FILE_BALANCING = "/data/apps/dbus-aggregate-batteries/storedvalue_last_balancing"
 
+# ---------------------------------------------------------------------------
+# SITE-SPECIFIC PATCH: fallback nominal capacity (Ah) per physical battery.
+#
+# Some native CAN-bus-BMS units (this system: a Revov / "Humensienk" 314 Ah
+# bank) do not transmit the /InstalledCapacity object over CAN at all, so
+# dbusmon.get_value() returns None for it. The upstream code adds this value
+# straight into a running total in several places without a None-check,
+# which raises a TypeError on every update cycle for such a battery.
+#
+# Keys are matched as a substring against the battery's D-Bus service name
+# (e.g. "com.victronenergy.battery.socketcan_can0"), so this keeps working
+# even if Venus OS ever renumbers can0/can1. Adjust the Ah values here if
+# you resize/replace a bank; nothing else in the file needs to change.
+#
+# Cell reference (for future maintenance, not used programmatically):
+#   can0 / Revov "Humensienk" bank, 314 Ah, 16S nominal 48V:
+#       Cell identified as CALB in a comment on a teardown video of this exact product
+#       ("HumSienk 314Ah Review & Complete Teardown", youtube.com/watch?v=NiyeUlm4LWE -
+#       confirmed to be a real, on-topic teardown of this specific 51.2V/314Ah/16kWh
+#       pack). Credible (someone with the pack open), but a YouTube comment isn't an
+#       official CALB datasheet, and it conflicts with an earlier "EVE" guess from a
+#       QR-code substring - treat as "probably CALB, not fully certain" rather than
+#       confirmed. Doesn't affect any setting below either way - standard LFP cells
+#       from reputable manufacturers all share a similar ~2.5-3.65V operating window,
+#       well inside MAX/MIN_CELL_VOLTAGE.
+#   can1 / LFP48100P w/ DRJC03 BMS, 100 Ah, 16S nominal 48V:
+#       CATL 001CB270, 3.2V nominal, 320Wh, 2.5-3.65V operating range,
+#       1C (100A) max continuous - pack BMS already limits to 80A, well
+#       under the cell's own rating.
+# ---------------------------------------------------------------------------
+FALLBACK_CAPACITY_AH = {
+    "socketcan_can0": 314,  # Revov / "Humensienk" bank (no native /InstalledCapacity)
+    "socketcan_can1": 100,  # LFP48100P w/ DRJC03 BMS (normally reports its own capacity)
+}
+
 
 def _write_atomic(path: str, content: str) -> None:
     """Write content atomically to path via a temporary file and os.replace."""
@@ -318,6 +353,113 @@ class DbusAggBatService(object):
         self._dbusMon = DbusMon()
         logging.info("dbusmonitor started")
 
+    # #############################################################################################################
+    # #############################################################################################################
+    # ## SITE-SPECIFIC PATCH: read /InstalledCapacity with a fallback for BMS that don't transmit it over CAN   ###
+    # #############################################################################################################
+    # #############################################################################################################
+
+    def _get_installed_capacity_ah(self, service: str) -> float:
+        """
+        Return the battery's installed capacity in Ah.
+
+        Reads /InstalledCapacity from the given D-Bus battery service. If the
+        BMS doesn't transmit this value (returns None), fall back to the
+        value configured in FALLBACK_CAPACITY_AH for this service, matched
+        by substring (e.g. "socketcan_can0"). Logs a warning once per battery
+        so a real BMS fault doesn't go unnoticed.
+        """
+        capacity = self._dbusMon.dbusmon.get_value(service, "/InstalledCapacity")
+        if capacity is not None:
+            return capacity
+
+        for key, fallback_ah in FALLBACK_CAPACITY_AH.items():
+            if key in service:
+                if not getattr(self, "_capacity_fallback_warned", None):
+                    self._capacity_fallback_warned = set()
+                if service not in self._capacity_fallback_warned:
+                    logging.warning(
+                        "%s does not report /InstalledCapacity; using configured fallback of %.0f Ah" % (service, fallback_ah)
+                    )
+                    self._capacity_fallback_warned.add(service)
+                return fallback_ah
+
+        logging.error(
+            "%s does not report /InstalledCapacity and no FALLBACK_CAPACITY_AH entry matches it. "
+            "Add an entry for this service in FALLBACK_CAPACITY_AH near the top of the file." % service
+        )
+        return 0
+
+    def _warn_once(self, service: str, tag: str, message: str) -> None:
+        """Log a warning only the first time for a given (service, tag) combination."""
+        if not getattr(self, "_generic_warned", None):
+            self._generic_warned = set()
+        key = (service, tag)
+        if key not in self._generic_warned:
+            logging.warning(message)
+            self._generic_warned.add(key)
+
+    def _get_cell_temp_extremes(self, service: str):
+        """
+        Return (max_cell_temp, min_cell_temp) for a battery.
+
+        Some native CAN-bus-BMS units (e.g. this system's Revov/"Humensienk"
+        bank) don't report per-cell temperature extremes at all
+        (/System/Max-/MinCellTemperature stay None). In that case fall back
+        to the single pack-level /Dc/0/Temperature reading, used for both
+        max and min, so the aggregate min/max search downstream never has
+        to compare a real number against None.
+        """
+        max_t = self._dbusMon.dbusmon.get_value(service, "/System/MaxCellTemperature")
+        min_t = self._dbusMon.dbusmon.get_value(service, "/System/MinCellTemperature")
+        if max_t is not None and min_t is not None:
+            return max_t, min_t
+
+        pack_temp = self._dbusMon.dbusmon.get_value(service, "/Dc/0/Temperature")
+        self._warn_once(
+            service,
+            "cell_temp",
+            "%s does not report per-cell temperature extremes; using /Dc/0/Temperature for both max and min." % service,
+        )
+        return pack_temp, pack_temp
+
+    def _get_cell_voltage_extremes(self, service: str):
+        """
+        Return (max_cell_voltage, min_cell_voltage) for a battery.
+
+        Falls back to an estimated per-cell voltage (pack voltage divided by
+        NR_OF_CELLS_PER_BATTERY) when the BMS doesn't report real per-cell
+        extremes. This is only an estimate (it assumes perfect cell balance)
+        but keeps balancing/CVL-reduction logic and the aggregate min/max
+        search from crashing on a None vs. float comparison.
+        """
+        max_v = self._dbusMon.dbusmon.get_value(service, "/System/MaxCellVoltage")
+        min_v = self._dbusMon.dbusmon.get_value(service, "/System/MinCellVoltage")
+        if max_v is not None and min_v is not None:
+            return max_v, min_v
+
+        pack_voltage = self._dbusMon.dbusmon.get_value(service, "/Dc/0/Voltage")
+        if pack_voltage is None:
+            return None, None
+        estimate = pack_voltage / settings.NR_OF_CELLS_PER_BATTERY
+        self._warn_once(
+            service,
+            "cell_voltage",
+            "%s does not report per-cell voltage extremes; estimating %.3fV/cell from pack voltage "
+            "(assumes perfect balance)." % (service, estimate),
+        )
+        return estimate, estimate
+
+    def _get_modules_count(self, service: str, path: str, default: int) -> int:
+        """
+        Return a per-battery module counter (/System/NrOfModules*), or a
+        sane default when the BMS doesn't break its pack down into modules.
+        Default is 1 for "online" (the pack as a whole counts as present)
+        and 0 for offline/blocking counters (no evidence of a problem).
+        """
+        value = self._dbusMon.dbusmon.get_value(service, path)
+        return value if value is not None else default
+
     # ####################################################################
     # ####################################################################
     # ## search Settings, to maintain CCL during dynamic CVL reduction ###
@@ -447,7 +589,7 @@ class DbusAggBatService(object):
                     productName = self._dbusMon.dbusmon.get_value(service, settings.BATTERY_PRODUCT_NAME_PATH)
                     shuntName = self._dbusMon.dbusmon.get_value(service, settings.SMARTSHUNT_INSTANCE_NAME_PATH)
                 if battery_service:
-                    if (productName is not None) and (settings.BATTERY_PRODUCT_NAME in productName):
+                    if (productName is not None) and (settings.BATTERY_PRODUCT_NAME.lower() in productName.lower()):
                         logging.info('   |- Correct battery product name "%s" found' % productName)
 
                         # Custom name, if exists
@@ -478,7 +620,7 @@ class DbusAggBatService(object):
 
                         # accumulate battery capacities and Soc if not read from charge file
                         if self._ownCharge < 0:
-                            battery_capacity = self._dbusMon.dbusmon.get_value(service, "/InstalledCapacity")
+                            battery_capacity = self._get_installed_capacity_ah(service)
                             battery_soc = self._dbusMon.dbusmon.get_value(service, "/Soc") * battery_capacity
                             InstalledCapacity += battery_capacity
                             Soc += battery_soc
@@ -912,24 +1054,34 @@ class DbusAggBatService(object):
 
                 # Capacity
                 step = "Read and calculate capacity, SoC, Time to go"
-                InstalledCapacity += self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/InstalledCapacity")
+                InstalledCapacity += self._get_installed_capacity_ah(self._batteries_dict[i])
 
                 if not settings.OWN_SOC:
                     if settings.CAN_batteries:
-                        ConsumedAmphours += self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/ConsumedAmphours") or 0
+                        consumed_get = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/ConsumedAmphours")
+                        if consumed_get is not None:
+                            ConsumedAmphours += consumed_get
+                        else:
+                            # BMS doesn't report consumed Ah (e.g. Revov): estimate from
+                            # fallback capacity and reported SoC instead of silently adding 0
+                            soc_for_consumed = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Soc")
+                            if soc_for_consumed is not None:
+                                ConsumedAmphours += -(
+                                    self._get_installed_capacity_ah(self._batteries_dict[i]) * (1 - soc_for_consumed / 100)
+                                )
                         capacity_get = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Capacity")
 
                         if capacity_get is not None:
                             Capacity += capacity_get
                         else:
-                            installed_capacity_get = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/InstalledCapacity")
+                            installed_capacity_get = self._get_installed_capacity_ah(self._batteries_dict[i])
                             soc_get = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Soc")
 
                             if installed_capacity_get is not None and soc_get is not None:
                                 Capacity += installed_capacity_get * soc_get / 100
 
                         soc_get = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Soc")
-                        installed_capacity_get = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/InstalledCapacity")
+                        installed_capacity_get = self._get_installed_capacity_ah(self._batteries_dict[i])
 
                         if soc_get is not None and installed_capacity_get is not None:
                             Soc += soc_get * installed_capacity_get
@@ -941,45 +1093,47 @@ class DbusAggBatService(object):
                         )
                     ttg = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/TimeToGo")
                     if (ttg is not None) and (TimeToGo is not None):
-                        TimeToGo += ttg * self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/InstalledCapacity")
+                        TimeToGo += ttg * self._get_installed_capacity_ah(self._batteries_dict[i])
                     else:
                         TimeToGo = None
 
                 # Temperature
                 step = "Read temperatures"
                 Temperature += self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Dc/0/Temperature")
+                _max_cell_temp, _min_cell_temp = self._get_cell_temp_extremes(self._batteries_dict[i])
                 MaxCellTemp_dict[
                     "%s: %s"
                     % (
                         self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/CustomName"),
                         self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/System/MaxTemperatureCellId"),
                     )
-                ] = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/System/MaxCellTemperature")
+                ] = _max_cell_temp
                 MinCellTemp_dict[
                     "%s: %s"
                     % (
                         self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/CustomName"),
                         self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/System/MinTemperatureCellId"),
                     )
-                ] = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/System/MinCellTemperature")
+                ] = _min_cell_temp
 
                 # Cell voltages
                 # cell ID : its voltage
                 step = "Read max. and min cell voltages and voltage sum"
+                _max_cell_voltage, _min_cell_voltage = self._get_cell_voltage_extremes(self._batteries_dict[i])
                 MaxCellVoltage_dict[
                     "%s: %s"
                     % (
                         self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/CustomName"),
                         self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/System/MaxVoltageCellId"),
                     )
-                ] = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/System/MaxCellVoltage")
+                ] = _max_cell_voltage
                 MinCellVoltage_dict[
                     "%s: %s"
                     % (
                         self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/CustomName"),
                         self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/System/MinVoltageCellId"),
                     )
-                ] = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/System/MinCellVoltage")
+                ] = _min_cell_voltage
 
                 # here an exception is raised and new read trial initiated if None is on Dbus
                 volt_sum_get = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Voltages/Sum")
@@ -987,11 +1141,8 @@ class DbusAggBatService(object):
                 if volt_sum_get is not None:
                     VoltagesSum_dict[i] = volt_sum_get
                 elif settings.CAN_batteries:
-                    max_cell_voltage = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/System/MaxCellVoltage")
-                    min_cell_voltage = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/System/MinCellVoltage")
-
-                    if max_cell_voltage is not None and min_cell_voltage is not None:
-                        VoltagesSum_dict[i] = ((max_cell_voltage + min_cell_voltage) / 2) * settings.NR_OF_CELLS_PER_BATTERY
+                    if _max_cell_voltage is not None and _min_cell_voltage is not None:
+                        VoltagesSum_dict[i] = ((_max_cell_voltage + _min_cell_voltage) / 2) * settings.NR_OF_CELLS_PER_BATTERY
                     else:
                         VoltagesSum_dict[i] = 0
                 else:
@@ -1002,11 +1153,13 @@ class DbusAggBatService(object):
 
                 # Battery state
                 step = "Read battery state"
-                NrOfModulesOnline += self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/System/NrOfModulesOnline")
-                NrOfModulesOffline += self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/System/NrOfModulesOffline")
-                NrOfModulesBlockingCharge += self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/System/NrOfModulesBlockingCharge")
+                NrOfModulesOnline += self._get_modules_count(self._batteries_dict[i], "/System/NrOfModulesOnline", 1)
+                NrOfModulesOffline += self._get_modules_count(self._batteries_dict[i], "/System/NrOfModulesOffline", 0)
+                NrOfModulesBlockingCharge += self._get_modules_count(self._batteries_dict[i], "/System/NrOfModulesBlockingCharge", 0)
                 # sum of modules blocking discharge
-                NrOfModulesBlockingDischarge += self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/System/NrOfModulesBlockingDischarge")
+                NrOfModulesBlockingDischarge += self._get_modules_count(
+                    self._batteries_dict[i], "/System/NrOfModulesBlockingDischarge", 0
+                )
 
                 step = "Read cell voltages"
                 for j in range(settings.NR_OF_CELLS_PER_BATTERY):
@@ -1428,6 +1581,17 @@ class DbusAggBatService(object):
             if TimeToGo is not None:
                 # weighted sum
                 TimeToGo = TimeToGo / InstalledCapacity
+            else:
+                # SITE-SPECIFIC PATCH: neither of this system's native CAN-BMS units
+                # transmits /TimeToGo at all, so the weighted-sum path above always
+                # stays None here (shows as "--" in the GUI). self._ownCharge is
+                # tracked unconditionally above regardless of OWN_SOC, so estimate
+                # TimeToGo from it instead of leaving it blank forever - same formula
+                # already used in the OWN_SOC=True branch above.
+                if (self._dbusMon.dbusmon.get_value("com.victronenergy.system", "/SystemState/LowSoc") == 0) and (Current < 0):
+                    TimeToGo = -3600 * self._ownCharge / Current
+                else:
+                    TimeToGo = None
 
         #######################
         # Send values to DBus #
