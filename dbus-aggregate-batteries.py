@@ -81,6 +81,24 @@ FALLBACK_CAPACITY_AH = {
     "socketcan_can1": 100,  # LFP48100P w/ DRJC03 BMS (normally reports its own capacity)
 }
 
+# ---------------------------------------------------------------------------
+# SITE-SPECIFIC PATCH: explicitly exclude battery services from aggregation.
+#
+# can0 (socketcan_can0, the native CAN-bus-bms reading of the Revov/"Humsienk"
+# 314 Ah pack) is deliberately kept running and connected - it's faster and
+# more stable than the Bluetooth link - but it must NOT also be counted here,
+# because the same physical battery is now aggregated via a separate
+# Bluetooth BLE bridge service (com.victronenergy.battery.bt_bms_*) that
+# provides real per-cell voltage/temperature/capacity data instead of the
+# estimates above. Counting both would double the capacity/current/voltage
+# contribution of one physical battery.
+#
+# Matched as a substring against the D-Bus service name, checked before any
+# other battery-matching logic. Add more entries here if you ever want to
+# keep another service connected-but-unaggregated.
+# ---------------------------------------------------------------------------
+EXCLUDED_BATTERY_SERVICES = ["socketcan_can0"]
+
 
 def _write_atomic(path: str, content: str) -> None:
     """Write content atomically to path via a temporary file and os.replace."""
@@ -581,6 +599,11 @@ class DbusAggBatService(object):
             service_names = [str(name) for name in self._dbusConn.list_names() if "com.victronenergy" in str(name)]
             for service in sorted(service_names):
                 logging.info("|- Dbusmonitor sees: %s" % (service))
+
+                if any(excluded in service for excluded in EXCLUDED_BATTERY_SERVICES):
+                    logging.info("   |- Explicitly excluded from aggregation (see EXCLUDED_BATTERY_SERVICES)")
+                    continue
+
                 # Current device is in Victron "battery" service
                 battery_service = settings.BATTERY_SERVICE_NAME in service
                 # Current device is in Victron "dcload" service (i.e. a SmartShunt set to DC metering)
@@ -1022,6 +1045,22 @@ class DbusAggBatService(object):
         try:
             for i in self._batteries_dict:
 
+                # SITE-SPECIFIC PATCH: some battery sources (e.g. the Bluetooth BLE
+                # bridge for the Revov/Humsienk pack) leave their last known
+                # Voltage/Current/etc. values in place when the link drops - only
+                # /Connected flips to 0, values stay non-None. The None-checks below
+                # alone wouldn't catch this "stale but not None" case, so check
+                # /Connected explicitly first and skip the battery the same way.
+                connected_get = self._dbusMon.dbusmon.get_value(self._batteries_dict[i], "/Connected")
+                if connected_get is not None and connected_get != 1:
+                    self._warn_once(
+                        self._batteries_dict[i],
+                        "not_connected",
+                        "%s reports /Connected=%s - excluding it from the aggregate until it reconnects."
+                        % (self._batteries_dict[i], connected_get),
+                    )
+                    continue
+
                 # DC
                 # to detect error
                 step = "Read V, I, P"
@@ -1038,11 +1077,23 @@ class DbusAggBatService(object):
                         power_get = voltage_get * current_get
 
                     if voltage_get is None or current_get is None or power_get is None:
-                        raise ValueError(
-                            "Missing mandatory D-Bus value while reading battery %s: "
-                            "Voltage=%s, Current=%s, Power=%s"
-                            % (i, voltage_get, current_get, power_get)
+                        # SITE-SPECIFIC PATCH: previously this raised unconditionally, which
+                        # aborts the ENTIRE aggregate cycle (both batteries) just because ONE
+                        # battery's CAN connection dropped (BMS reset, cable pulled, BMS
+                        # tripped its own protection and disconnected). After READ_TRIALS
+                        # failed retries the whole aggregate service used to restart - meaning
+                        # DVCC would briefly lose ALL battery data, including from the healthy
+                        # battery, at exactly the moment a clear signal matters most.
+                        # Instead: skip only this battery for this cycle and keep aggregating
+                        # whatever batteries are still responding.
+                        self._warn_once(
+                            self._batteries_dict[i],
+                            "connection_lost",
+                            "%s is not reporting Voltage/Current/Power (CAN connection lost or battery "
+                            "disconnected?) - excluding it from the aggregate until it returns."
+                            % self._batteries_dict[i],
                         )
+                        continue
 
                     Voltage += voltage_get
                     Current += current_get
@@ -1289,6 +1340,58 @@ class DbusAggBatService(object):
             else:
                 MaxChargeCurrent = self._fn._min(MaxChargeCurrent_list) * settings.NR_OF_BATTERIES
                 MaxDischargeCurrent = self._fn._min(MaxDischargeCurrent_list) * settings.NR_OF_BATTERIES
+
+            # #########################################################################
+            # SITE-SPECIFIC PATCH: minimal, independent overvoltage safety net.
+            #
+            # The upstream dynamic-CVL-reduction / DC-feed-in-disable mechanism only runs
+            # under OWN_CHARGE_PARAMETERS=True, bundled with a much larger interpolation/
+            # balancing-voltage state machine we deliberately do NOT want here - it would
+            # rely on our own ESTIMATED cell voltage for the Revov/Humensienk pack (assumes
+            # perfect balance by construction), giving false precision for exactly the one
+            # pack that most needs a real safety margin.
+            #
+            # This is just the protective piece, decoupled from all of that: if any cell
+            # (real measurement from can1, or our estimate for can0) reaches
+            # MAX_CELL_VOLTAGE, immediately cap the published CVL below it and disable
+            # DC-coupled PV feed-in - independent of what either BMS's own reported
+            # Info/MaxChargeVoltage says, and independent of OWN_CHARGE_PARAMETERS.
+            # Capping CVL below present pack voltage is what already causes the MultiPlus
+            # to switch to active discharge (confirmed working behaviour, manually at 54V).
+            # Re-enables automatically once cell voltage drops back below the limit.
+            #
+            # This coexists with, and does not replace, a manually configured lower DVCC
+            # "Max charge voltage" - DVCC takes the most restrictive of all sources, so
+            # whichever ceiling is currently lower is the one that actually applies.
+            # #########################################################################
+            if MaxCellVoltage >= settings.MAX_CELL_VOLTAGE:
+                if not self._dynamicCVL:
+                    self._dynamicCVL = True
+                    logging.warning(
+                        "Overvoltage safety net triggered: %s reached %.3fV (limit %.3fV) - "
+                        "capping CVL and disabling DC-coupled PV feed-in."
+                        % (MaxVoltageCellId, MaxCellVoltage, settings.MAX_CELL_VOLTAGE)
+                    )
+                    if not self._dynCVLactivated:
+                        self._dynCVLactivated = True
+                        self._DCfeedActive = self._dbusMon.dbusmon.get_value(
+                            "com.victronenergy.settings", "/Settings/CGwacs/OvervoltageFeedIn"
+                        )
+                        self._dbusMon.dbusmon.set_value("com.victronenergy.settings", "/Settings/CGwacs/OvervoltageFeedIn", 0)
+
+                MaxChargeVoltage = min(MaxChargeVoltage, settings.NR_OF_CELLS_PER_BATTERY * settings.MAX_CELL_VOLTAGE)
+
+            elif self._dynamicCVL:
+                self._dynamicCVL = False
+                logging.warning(
+                    "Overvoltage safety net cleared: cell voltage back below limit - "
+                    "restoring normal CVL and DC-coupled PV feed-in."
+                )
+                self._dbusMon.dbusmon.set_value(
+                    "com.victronenergy.settings", "/Settings/CGwacs/OvervoltageFeedIn", self._DCfeedActive
+                )
+                self._DCfeedActive = False
+                self._dynCVLactivated = False
 
         AllowToCharge = self._fn._min(AllowToCharge_list)
         AllowToDischarge = self._fn._min(AllowToDischarge_list)
@@ -1565,6 +1668,13 @@ class DbusAggBatService(object):
         if abs(self._ownCharge - self._ownCharge_old) >= (settings.CHARGE_SAVE_PRECISION * InstalledCapacity):
             _write_atomic(_STATE_FILE_CHARGE, "%.3f" % self._ownCharge)
             self._ownCharge_old = self._ownCharge
+
+        # SITE-SPECIFIC PATCH: if every battery was skipped above (all CAN connections lost
+        # simultaneously - unlikely, but possible e.g. during a shared bus/power issue), there
+        # is nothing valid to aggregate this cycle. Fail loudly and let the existing retry
+        # logic handle it, instead of a bare ZeroDivisionError on the Soc calculation below.
+        if InstalledCapacity <= 0:
+            raise ValueError("No battery is currently reporting valid data - cannot compute an aggregate this cycle.")
 
         # overwrite BMS charge values
         if settings.OWN_SOC:
