@@ -1373,11 +1373,13 @@ class DbusAggBatService(object):
                         % (MaxVoltageCellId, MaxCellVoltage, settings.MAX_CELL_VOLTAGE)
                     )
                     if not self._dynCVLactivated:
-                        self._dynCVLactivated = True
-                        self._DCfeedActive = self._dbusMon.dbusmon.get_value(
-                            "com.victronenergy.settings", "/Settings/CGwacs/OvervoltageFeedIn"
-                        )
-                        self._dbusMon.dbusmon.set_value("com.victronenergy.settings", "/Settings/CGwacs/OvervoltageFeedIn", 0)
+# DEAKTIVIERT: Greift nicht mehr in die Einspeisung ein
+                    # if not self._dynCVLactivated:
+                    #     self._dynCVLactivated = True
+                    #     self._DCfeedActive = self._dbusMon.dbusmon.get_value(
+                    #         "com.victronenergy.settings", "/Settings/CGwacs/OvervoltageFeedIn"
+                    #     )
+                    #     self._dbusMon.dbusmon.set_value("com.victronenergy.settings", "/Settings/CGwacs/OvervoltageFeedIn", 0)
 
                 MaxChargeVoltage = min(MaxChargeVoltage, settings.NR_OF_CELLS_PER_BATTERY * settings.MAX_CELL_VOLTAGE)
 
@@ -1387,11 +1389,12 @@ class DbusAggBatService(object):
                     "Overvoltage safety net cleared: cell voltage back below limit - "
                     "restoring normal CVL and DC-coupled PV feed-in."
                 )
-                self._dbusMon.dbusmon.set_value(
-                    "com.victronenergy.settings", "/Settings/CGwacs/OvervoltageFeedIn", self._DCfeedActive
-                )
-                self._DCfeedActive = False
-                self._dynCVLactivated = False
+# DEAKTIVIERT: Greift nicht mehr in die Einspeisung ein
+                # self._dbusMon.dbusmon.set_value(
+                #     "com.victronenergy.settings", "/Settings/CGwacs/OvervoltageFeedIn", self._DCfeedActive
+                # )
+                # self._DCfeedActive = False
+                # self._dynCVLactivated = False
 
         AllowToCharge = self._fn._min(AllowToCharge_list)
         AllowToDischarge = self._fn._min(AllowToDischarge_list)
